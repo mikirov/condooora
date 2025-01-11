@@ -1,0 +1,57 @@
+services:
+  # Postgres database service
+  db:
+    image: postgres:15
+    container_name: postgres-db
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: access_control
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    network_mode: "host"  # Use host network
+
+  # Backend service
+  backend:
+    build:
+      context: ./backend
+      dockerfile: docker/backend.Dockerfile
+    container_name: condoora-backend
+    depends_on:
+      - db
+    volumes:
+      - ./backend:/usr/src/backend
+    network_mode: "host"  # Use host network
+
+      # First Frontend service
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: condoora-dashboard-frontend
+    volumes:
+      - ./frontend:/app
+    network_mode: "host"  # Use host network
+
+  # Second Frontend service
+  device-registration-frontend:
+    build:
+      context: ./device-registration-frontend
+      dockerfile: Dockerfile
+    container_name: condoora-device-registration-frontend
+    volumes:
+      - ./device-registration-frontend:/app
+    network_mode: "host"  # Use host network
+
+  # Adminer service
+  adminer:
+    image: adminer:latest
+    container_name: adminer
+    environment:
+      ADMINER_DEFAULT_SERVER: localhost
+    depends_on:
+      - db
+    network_mode: "host"  # Use the host network
+
+volumes:
+  postgres-data:
