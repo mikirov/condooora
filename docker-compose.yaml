@@ -12,16 +12,16 @@ services:
     network_mode: "host"  # Use host network
 
   # Backend service
-  backend:
-    build:
-      context: ./backend
-      dockerfile: docker/backend.Dockerfile
-    container_name: condoora-backend
-    depends_on:
-      - db
-    volumes:
-      - ./backend:/usr/src/backend
-    network_mode: "host"  # Use host network
+  # backend:
+  #   build:
+  #     context: ./backend
+  #     dockerfile: docker/backend.Dockerfile
+  #   container_name: condoora-backend
+  #   depends_on:
+  #     - db
+  #   volumes:
+  #     - ./backend:/usr/src/backend
+  #   network_mode: "host"  # Use host network
 
       # First Frontend service
   frontend:

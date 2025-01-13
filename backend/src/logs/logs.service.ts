@@ -14,8 +14,8 @@ export class LogsService {
   ) {}
 
   async createLog(
-    cardId: string,
-    userId: string,
+    cardId: number,
+    userId: number,
     attempt: number,
     timestamp: Date,
     deviceId: string,
@@ -55,7 +55,7 @@ export class LogsService {
     };
   }
 
-  async findByUserId(userId: string, limit: number, page: number) {
+  async findByUserId(userId: number, limit: number, page: number) {
     const [data, total] = await this.logsRepository.findAndCount({
       where: { userId },
       skip: (page - 1) * limit,
@@ -66,7 +66,7 @@ export class LogsService {
     return { data, total, page, limit };
   }
 
-  async findByCardId(cardId: string, limit: number, page: number) {
+  async findByCardId(cardId: number, limit: number, page: number) {
     const [data, total] = await this.logsRepository.findAndCount({
       where: { cardId },
       skip: (page - 1) * limit,

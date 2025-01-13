@@ -1,4 +1,3 @@
-// src/logs/log.entity.ts
 import { Device } from 'src/device/entities/device.entity';
 import {
   Entity,
@@ -39,11 +38,11 @@ export class Log {
   @PrimaryGeneratedColumn()
   id: number;
 
-  @Column()
-  cardId: string;
+  @Column({ type: 'int', unsigned: true }) // Store cardId as an unsigned integer
+  cardId: number;
 
-  @Column()
-  userId: string;
+  @Column({ type: 'int', unsigned: true }) // Store userId as an unsigned integer
+  userId: number;
 
   @Column({
     type: 'enum',

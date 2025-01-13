@@ -5,7 +5,8 @@ USERNAME=$(openssl rand -hex 8)
 PASSWORD=$(openssl rand -base64 16)
 
 # Create PostgreSQL user and database
-sudo -u postgres psql <<EOF
+# sudo -u postgres psql <<EOF#
+psql <<EOF
 CREATE USER "$USERNAME" WITH PASSWORD '$PASSWORD';
 CREATE DATABASE access_control;
 GRANT ALL PRIVILEGES ON DATABASE access_control TO "$USERNAME";

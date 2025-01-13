@@ -1,20 +1,40 @@
 // src/commands/command.service.ts
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { In, Repository } from 'typeorm';
 import { CommandType } from './command-types';
 import { Command } from './entities/command.entity';
 import { Device } from 'src/device/entities/device.entity';
-import { CommandDto } from './dto/command.dto';
 
 @Injectable()
 export class CommandService {
+  private readonly logger = new Logger(CommandService.name);
+
   constructor(
     @InjectRepository(Command)
     private readonly commandRepository: Repository<Command>,
     @InjectRepository(Device)
     private readonly deviceRepository: Repository<Device>,
   ) {}
+
+  /**
+   * Set the sent status of a list of commands to true
+   * @param commandIds - List of command IDs to update
+   * @returns - Number of commands updated
+   */
+  async markCommandsAsSent(commandIds: number[]): Promise<number> {
+    if (!commandIds || commandIds.length === 0) {
+      this.logger.log(`No command IDs provided.'`);
+      return 0;
+    }
+
+    const updateResult = await this.commandRepository.update(
+      { id: In(commandIds) },
+      { sent: true },
+    );
+
+    return updateResult.affected || 0; // Return the number of commands updated
+  }
 
   /**
    * Queue a command for a specific device
@@ -47,29 +67,17 @@ export class CommandService {
     return await this.commandRepository.save(command);
   }
 
-  /**
-   * Retrieve all commands for a specific device
-   * @param macAddress - MAC address of the target device
-   * @returns - List of CommandDto objects for the device
-   */
-  async getCommandsForDevice(macAddress: string): Promise<CommandDto[]> {
-    const commands = await this.commandRepository.find({
+  async getUnsentCommandsForDevice(macAddress: string): Promise<Command[]> {
+    return await this.commandRepository.find({
+      where: { device: { macAddress }, sent: false },
+      relations: ['device'],
+    });
+  }
+
+  async getAllCommandsForDevice(macAddress: string): Promise<Command[]> {
+    return await this.commandRepository.find({
       where: { device: { macAddress } },
       relations: ['device'],
     });
-
-    // Map Command entities to CommandDto objects
-    return commands.map((command) => ({
-      name: command.name,
-      payload: command.payload,
-    }));
-  }
-
-  /**
-   * Clear all commands for a specific device
-   * @param macAddress - MAC address of the target device
-   */
-  async clearCommands(macAddress: string): Promise<void> {
-    await this.commandRepository.delete({ device: { macAddress } });
   }
 }

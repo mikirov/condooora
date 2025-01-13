@@ -10,6 +10,9 @@ export class Command {
   @Column()
   name: string;
 
+  @Column({ default: false })
+  sent: boolean;
+
   @Column('json', { nullable: true })
   payload?: any;
 

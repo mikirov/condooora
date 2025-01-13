@@ -6,9 +6,43 @@
 #include <Wiegand.h>
 #include <ArduinoJson.h>
 
-const bool DEBUG_LOG = true;
+// may not be needed, investigate further
+#include <AsyncTCP.h>
+
+// #include "Vector.h"
+#include <vector>
+
+#ifndef HAS_BACKEND
+//change to false if it should not have backend server connection
+#define HAS_BACKEND false
+#else
+    #error HAS_BACKEND defined already!
+#endif
+
+#ifndef HAS_LOCAL_SERVER
+//change to true if it should not have backend server connection
+#define HAS_LOCAL_SERVER true
+#else
+    #error HAS_BACKEND defined already!
+#endif
+
+#if HAS_BACKEND && HAS_LOCAL_SERVER
+    #error "Both HAS_BACKEND and HAS_LOCAL_SERVER cannot be set simultaneously!"
+#endif
+
+// Pin Definitions -> DO NOT MODIFY
+const uint8_t RELAY1_PIN = 22;
+const uint8_t RELAY2_PIN = 23;
+const uint8_t ENTRY_READER_D0 = 12;
+const uint8_t ENTRY_READER_D1 = 14;
+const uint8_t LEAVE_READER_D0 = 26  ; // not sure, most likely wrong
+const uint8_t LEAVE_READER_D1 = 27; // could be reversed
+const uint8_t PIN_BEEP = 5;  //  Pin for buzzer -> Arduino 5, GPIO 8, D5 pin
+
+// Debug and logging modes, can be set to false in production. Shouldn't impact performance much
 const bool INIT_LOG = true;
 const bool DEV_MODE = true;
+const bool DEBUG_LOG = true;
 
 // Constants and Configurable Variables
 // char WIFI_SSID[20] = "A1_59E8";
@@ -19,7 +53,11 @@ char SERVER_BASE_URL[50] = "http://172.20.10.6:3003";
 char NTP_SERVER[50] = "pool.ntp.org";
 // long POLLING_INTERVAL = 3000;
 long POLLING_INTERVAL = 10000;
-int QUEUE_SIZE = 10;
+
+// assuming we have 4 (cardId) + 4 (userId) + 4 (timestamp) + 1 (attempt enum) = 13 bytes for each log stored in preferences, this is 13000 bytes, which is way less than the 4 MB limit of ESP32 flash
+int QUEUE_SIZE = 1000;
+
+uint32_t logIndex = 0;
 
 // DHCP and Static IP Settings
 bool USE_DHCP = true;
@@ -27,6 +65,22 @@ IPAddress staticIP(192, 168, 1, 50);
 IPAddress gateway(192, 168, 1, 1);
 IPAddress subnet(255, 255, 255, 0);
 IPAddress dns(8, 8, 8, 8);
+
+#if HAS_LOCAL_SERVER
+  String index_html;// = "<!DOCTYPE HTML><html><head><title>HTML Form to Input Data</title><meta name='viewport' content='width=device-width, initial-scale=1'><style>html {font-family: Times New Roman; display: inline-block; text-align: center;}table{display: inline-block; text-align: center;}h4 {font-size: 1.0rem; color: #FF0000;}</style></head><body><h4>Edit Users</h4><form action='/get'>User: <input type='text' name='input_number' size='12'><br />Card Number: <input type='text' name='input_card' size='12'><input type='submit' value='Submit'></form><br></body></html>";
+  const char* ssid     = "Access control";
+  const char* password = "1223334444";
+  WiFiServer server(80);
+  String header;
+  String tablex;
+
+  void handleLocalServer();
+  void handleIncomingClient(WiFiClient& client);
+  String buildTableData();
+  void sendHttpResponse(WiFiClient& client);
+  void processHttpRequest();
+
+#endif
 
 // Command Enum
 enum CommandType {
@@ -40,56 +94,61 @@ enum CommandType {
   UNKNOWN_COMMAND
 };
 
-// Pin Definitions
-const uint8_t RELAY1_PIN = 22;
-const uint8_t RELAY2_PIN = 23;
-const uint8_t ENTRY_READER_D0 = 12;
-const uint8_t ENTRY_READER_D1 = 14;
-const uint8_t LEAVE_READER_D0 = 21; // not sure, most likely wrong
-const uint8_t LEAVE_READER_D1 = 27; // could be reversed
-const uint8_t PIN_BEEP = 5;  //  Pin for buzzer -> Arduino 5, GPIO 8, D5 pin
+const uint8_t BEEP_HIGH = 180;
+const uint8_t BEEP_LOW = 0;
 
 // Relay and Beep State Config
 bool useBothRelays = false;  // Config flag for using both relays
 bool isRelayOpen = false;
 uint8_t relay1DefaultState = LOW;  // Default state for relay 1
 uint8_t relay2DefaultState = LOW;  // Default state for relay 2
-uint16_t successBeepDuration = 100;
-uint16_t successBeepRepeat = 5;
-uint16_t failBeepDuration = 300;
-uint16_t failBeepRepeat = 3;
+uint16_t successBeepDuration = 150;
+uint16_t successBeepRepeat = 10;
+uint16_t failBeepDuration = 1000;
+uint16_t failBeepRepeat = 2;
 
-// Authentication Log Enum
-enum AuthAttempt {
-  ENTRY_ALLOWED,
-  INTERMEDIARY_ACCESS,
-  ANTI_PASSBACK,
-  NOT_REGISTERED,
-  DEACTIVATED_CARD
-};
 
 // Flags Bitmask
 const uint8_t ANTI_PASSBACK_FLAG = 0x1;
 const uint8_t DEACTIVATED_FLAG = 0x2;
 const uint8_t INTERMEDIARY_GATE_FLAG = 0x4;
 
-// Structures
-struct LogEntry {
+#if HAS_BACKEND
+  const uint8_t AUTH_ATTEMPT_NOT_REGISTERED = 0;
+  const uint8_t AUTH_ATTEMPT_ENTRY_ALLOWED = 1;
+  const uint8_t AUTH_ATTEMPT_INTERMEDIARY_ACCESS = 2;
+  const uint8_t AUTH_ATTEMPT_ANTI_PASSBACK = 3;
+  const uint8_t AUTH_ATTEMPT_DEACTIVATED_CARD = 4;
+
+  // Structures
+  struct LogEntry {
+    uint32_t logIndex;
+    uint32_t cardId;
+    uint32_t userId;
+    uint32_t timestamp;
+    uint8_t attempt;
+
+        // Constructor for convenience
+      LogEntry(uint32_t logIndex = 0, uint32_t cardId = 0, uint32_t userId = 0, uint32_t timestamp = 0, uint8_t attempt = 0)
+          : logIndex(logIndex), cardId(cardId), userId(userId), timestamp(timestamp), attempt(attempt) {}
+  };
+#endif
+
+struct User {
+  uint16_t id;
   uint32_t cardId;
-  uint32_t userId;
-  AuthAttempt attempt;
-  unsigned long timestamp;
+  uint8_t metadataBitmask; //bitmask 
+
+      User(uint16_t id, uint32_t cardId, uint8_t metadataBitmask)
+        : id(id), cardId(cardId), metadataBitmask(metadataBitmask) {}
 };
+
+std::vector<User> users;
 
 // Globals
 WIEGAND entryReader;
 WIEGAND leaveReader;
-WiFiUDP ntpUDP;
-NTPClient timeClient(ntpUDP, NTP_SERVER, 0, 60000);
 Preferences preferences;
-String jwtToken;
-LogEntry* logQueue;
-int logQueueIndex = 0;
 unsigned long previousMillis = 0;
 unsigned long previousTimeUpdateMillis = 0;
 bool isBeeping = false;
@@ -97,50 +156,77 @@ unsigned long lastBeepTime = 0;
 unsigned long lastRelayOpenTime = 0;
 uint16_t beepStep = 0;
 uint16_t beep_duration = 100;
-uint16_t beep_repeat = 30;
+uint16_t beep_repeat = 15;
 uint16_t relay_open_duration = 3000;
+
+#if HAS_BACKEND
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, NTP_SERVER, 0, 60000);
+String jwtToken;
 bool isRegistered = false;  // Flag to check if registration was successful
+bool hasInitialWifiConnectionCompleted = false;
+#endif
 
 // Function Prototypes
+#if HAS_BACKEND
 void connectToWiFi(const char* ssid, const char* password);
 void reconnectToWiFi();
 void pollServerForCommands();
-void handleWiegand();
-void enqueueLogEntry(uint32_t cardId, uint32_t userId, AuthAttempt attempt);
+void enqueueLogEntry(uint32_t cardId, uint32_t userId, char attempt);
 CommandType parseCommandType(const String& commandStr);
-void sendLogQueue();
-uint16_t getUserIdFromCard(uint32_t cardId);
-uint32_t getUserMetadata(uint16_t userId);
-void setUserMetadata(uint16_t userId, uint32_t metadata, uint32_t cardId = 0);
+bool sendLogQueue();
 String getRequestWithAuth(const String& endpoint);
 String postRequestWithPayload(const String& endpoint);
-void setupLogQueue();
 bool registerDevice();
 void handleCommand(CommandType commandType, DynamicJsonDocument& jsonDoc);
+IPAddress IPAddressFromString(const char* str);
+#endif
+
+void handleWiegand();
+uint16_t getUserIdFromCard(uint32_t cardId);
+uint8_t getUserMetadata(uint16_t userId);
+void setUserMetadata(uint16_t userId, uint8_t metadata, uint32_t cardId = 0);
 void startBeep(uint16_t duration, uint16_t repeat);
 void stopBeep();
-void processBeep(uint16_t duration, uint16_t repeat);
+void processBeep();
 void successBeep();
 void errorBeep();
 void setRelayState(uint8_t state);
-IPAddress IPAddressFromString(const char* str);
+void processRelayState();
 
 void setup() {
   Serial.begin(115200);
 
-  preferences.begin("config", true); // Open the namespace for reading
-  strlcpy(SERVER_BASE_URL, preferences.getString("serverBaseUrl", SERVER_BASE_URL).c_str(), sizeof(SERVER_BASE_URL));
-  strlcpy(NTP_SERVER, preferences.getString("ntpServer", NTP_SERVER).c_str(), sizeof(NTP_SERVER));
-  POLLING_INTERVAL = preferences.getInt("pollingInterval", POLLING_INTERVAL);
-  QUEUE_SIZE = preferences.getInt("queueSize", QUEUE_SIZE);
-  jwtToken = preferences.getString("jwtToken", jwtToken);
-  isRegistered = preferences.getBool("registered", false);
-  preferences.end();
+  #if HAS_BACKEND
+    preferences.begin("config", true); // Open the namespace for reading
+      strlcpy(SERVER_BASE_URL, preferences.getString("serverBaseUrl", SERVER_BASE_URL).c_str(), sizeof(SERVER_BASE_URL));
+      strlcpy(NTP_SERVER, preferences.getString("ntpServer", NTP_SERVER).c_str(), sizeof(NTP_SERVER));
+      POLLING_INTERVAL = preferences.getInt("pollingInterval", POLLING_INTERVAL);
+      QUEUE_SIZE = preferences.getInt("queueSize", QUEUE_SIZE);
+      logIndex = preferences.getUInt("logIndex", QUEUE_SIZE);
+      // jwtToken = preferences.getString("jwtToken", jwtToken);
+      // isRegistered = preferences.getBool("registered", false);
+    preferences.end();
 
-  if(INIT_LOG) Serial.printf("JWT Token: %s\n", jwtToken.c_str());
+    if(INIT_LOG) Serial.printf("JWT Token: %s\n", jwtToken.c_str());
 
-  reconnectToWiFi();
-  setupLogQueue();
+    reconnectToWiFi();
+    timeClient.begin();
+  #elif HAS_LOCAL_SERVER
+    WiFi.softAP(ssid, password);
+    IPAddress IP = WiFi.softAPIP();
+    Serial.print("AP IP address: ");
+    Serial.println(IP);
+    preferences.begin("Cards", false);
+    index_html = "<!DOCTYPE HTML><html><head><title>HTML Form to Input Data</title><meta name='viewport' content='width=device-width, initial-scale=1'>";
+    index_html += "<style>html {font-family: Times New Roman; display: inline-block; text-align: center;}table{display: inline-block; text-align: center;}h4 {font-size: 1.0rem; color: #FF0000;}</style>";
+    index_html += "</head><body><h4>ACCESS CONTROL</h4><form action='/GET'><table><tr><td align='right'>User:</td><td align='left'><input type='text' name='input_number' size='12'></td></tr>";
+    index_html += "<tr><td align='right'>Card Number:</td><td align='left'><input type='text' name='input_card' size='12'></td></tr>";
+    index_html += "<tr><td align='right'>Active:</td><td align='left'><input type='text' name='input_active' size='12'></td></tr>";
+    index_html += "<tr><td colspan='2' align='center'><input type='submit' value='Submit'></td></tr></table></form>";
+    tablex="<table border='1px'><tr><th>ID</th><th>CardNo</th><th>act</th><th>ID</th><th>CardNo</th><th>act</th><th>ID</th><th>CardNo</th><th>act</th><th>ID</th><th>CardNo</th><th>act</th><th>ID</th><th>CardNo</th><th>act</th></tr>";
+    server.begin();
+  #endif
 
   // Initialize Wiegand readers
   entryReader.begin(ENTRY_READER_D0, ENTRY_READER_D1);
@@ -152,25 +238,355 @@ void setup() {
   digitalWrite(RELAY1_PIN, relay1DefaultState);
   digitalWrite(RELAY2_PIN, relay2DefaultState);
 
-  if (DEBUG_LOG) Serial.println("Relays set up");
+  // if (DEBUG_LOG) Serial.println("Relays set up");
   // Initialize buzzer
   beep_duration = 100;
-  beep_repeat = 5;
+  beep_repeat = 15;
   
   pinMode(PIN_BEEP, OUTPUT);
   digitalWrite(PIN_BEEP, LOW);
-  if (DEBUG_LOG) Serial.println("Buzzer set up");
-
-  //TODO: find cause this resets the ESP
-  timeClient.begin();
+  // if (DEBUG_LOG) Serial.println("Buzzer set up");
 
   if (DEBUG_LOG) Serial.println("Initialization complete");
 }
 
-void setupLogQueue() {
-  logQueue = (LogEntry*)malloc(sizeof(LogEntry) * QUEUE_SIZE);
+void loop() {
+
+  #if HAS_BACKEND
+    if(hasInitialWifiConnectionCompleted && WiFi.status() != WL_CONNECTED) {
+      reconnectToWiFi();
+    }
+
+    unsigned long currentMillis = millis();
+
+    if (currentMillis - previousMillis >= POLLING_INTERVAL) {
+      previousMillis = currentMillis;
+
+      // Attempt to register if not registered
+      if (!isRegistered) {
+        if(DEBUG_LOG) Serial.print("Not registered, registering to server ...");
+        isRegistered = registerDevice();
+      } else {
+        // Once registered, start polling for commands
+        pollServerForCommands();
+      }
+    }
+
+    //update the time every 60 seconds
+    else if (currentMillis - previousTimeUpdateMillis >= 60000) {
+      previousTimeUpdateMillis = currentMillis;
+      timeClient.update();
+      if(DEBUG_LOG) Serial.printf("Updated time. Current time: %s\n", timeClient.getFormattedTime().c_str());
+    }
+  #elif HAS_LOCAL_SERVER
+  handleLocalServer();
+  #endif
+
+  handleWiegand();
+  processBeep();
+  processRelayState();
 }
 
+#if HAS_LOCAL_SERVER
+void handleIncomingClient(WiFiClient& client) {
+  String currentLine = "";
+  while (client.connected()) {
+    if (client.available()) {
+      char c = client.read();
+      header += c;
+
+      if (c == '\n') {
+        if (currentLine.length() == 0) {
+          sendHttpResponse(client);
+          break;
+        } else {
+          currentLine = "";
+        }
+      } else if (c != '\r') {
+        currentLine += c;
+      }
+    }
+  }
+  header = "";
+  client.stop();
+  Serial.println("Client disconnected.");
+}
+// Build the HTML table with user data
+String buildTableData() {
+    String table = R"rawliteral(
+      <table class="table-auto w-full border-collapse border border-gray-300">
+        <thead>
+          <tr class="bg-blue-100">
+            <th class="border border-gray-300 px-4 py-2">User ID</th>
+            <th class="border border-gray-300 px-4 py-2">Card ID</th>
+            <th class="border border-gray-300 px-4 py-2">Active</th>
+          </tr>
+        </thead>
+        <tbody>
+    )rawliteral";
+
+    for (size_t i = 0; i < users.size(); i++) {
+        table += "<tr class='hover:bg-gray-100'>";
+        table += "<td class='border border-gray-300 px-4 py-2'>" + String(users[i].id) + "</td>";
+        table += "<td class='border border-gray-300 px-4 py-2'>" + String(users[i].cardId) + "</td>";
+        table += "<td class='border border-gray-300 px-4 py-2'>" + String(users[i].metadataBitmask ? "Yes" : "No") + "</td>";
+        table += "</tr>";
+    }
+
+    table += "</tbody></table>";
+    return table;
+}
+
+// Serve HTTP response with HTML content
+void sendHttpResponse(WiFiClient& client) {
+    processHttpRequest(); // Process the incoming request
+
+    // Serve HTML response
+    client.println("HTTP/1.1 200 OK");
+    client.println("Content-type:text/html");
+    client.println("Connection: close");
+    client.println();
+
+    // HTML structure with Tailwind CSS
+    client.println(R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Registered Users</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-100 text-gray-800">
+  <header class="bg-blue-500 text-white py-4 shadow">
+    <div class="container mx-auto text-center">
+      <h1 class="text-2xl font-bold">User Registration Dashboard</h1>
+    </div>
+  </header>
+  <main class="container mx-auto my-6">
+    <div class="bg-white shadow rounded-lg p-6">
+      <h2 class="text-xl font-semibold mb-4">Registered Users</h2>
+)rawliteral");
+
+    client.println(buildTableData()); // Inject dynamic table data
+
+    client.println(R"rawliteral(
+    </div>
+  </main>
+  <footer class="bg-gray-800 text-white py-4">
+    <div class="container mx-auto text-center">
+      <p>&copy; 2025 Local Server. All rights reserved.</p>
+    </div>
+  </footer>
+</body>
+</html>
+    )rawliteral");
+}
+
+void processHttpRequest() {
+    if (header.indexOf("/GET?") < 0) return;
+
+    // Extract query parameters
+    String query = header.substring(header.indexOf("/GET?") + 5, header.indexOf("HTTP/1.1") - 1);
+    String id = query.substring(0, query.indexOf("&"));
+    String cardIdStr = query.substring(query.indexOf("&cardId=") + 8, query.lastIndexOf("&active="));
+    String activeStr = query.substring(query.indexOf("&active=") + 8);
+
+    uint32_t cardId = cardIdStr.toInt();
+    bool activeFlag = (activeStr == "true");
+    uint16_t userId = id.toInt();
+    uint8_t bitmask = getUserMetadata(userId);
+
+    // Check if the user already exists
+    for (size_t i = 0; i < users.size(); i++) {
+        if (users[i].id == userId) {
+            users[i].cardId = cardId; // Update cardId
+            users[i].metadataBitmask = bitmask & activeFlag; // Update active status
+            return;
+        }
+    }
+
+    // Add new user if not found
+    users.push_back(User(id.toInt(), cardId, bitmask & activeFlag));
+    Serial.printf("New User Added: ID=%s, CardID=%u, Active=%s\n", userId, cardId, activeFlag ? "true" : "false");
+}
+
+void handleLocalServer() {
+  WiFiClient client = server.available(); // Listen for incoming clients
+  if (client) {
+    Serial.println("New Client Connected.");
+    handleIncomingClient(client);
+  }
+}
+#endif
+
+void successBeep() {
+  startBeep(successBeepDuration, successBeepRepeat);
+}
+
+void errorBeep() {
+  startBeep(failBeepDuration, failBeepRepeat);
+}
+
+void startBeep(uint16_t duration, uint16_t repeat) {
+  isBeeping = true;
+  beep_duration = duration;
+  beep_repeat = repeat;
+  lastBeepTime = millis();
+  analogWrite(PIN_BEEP, BEEP_HIGH);
+  beepStep = 0;
+}
+
+void stopBeep() {
+  isBeeping = false;
+  analogWrite(PIN_BEEP, BEEP_LOW);
+}
+
+void processBeep() {
+  if (!isBeeping) return;
+  // if(DEBUG_LOG) Serial.println("Processing beep");
+  unsigned long currentMillis = millis();
+  if (currentMillis - lastBeepTime >= beep_duration) {
+    // if(DEBUG_LOG) Serial.println("Beep duration elapsed");
+    if(beepStep % 2 == 0) {
+      analogWrite(PIN_BEEP, BEEP_HIGH);
+    } else {
+      analogWrite(PIN_BEEP, BEEP_LOW);
+    }
+    lastBeepTime = currentMillis;
+    beepStep++;
+
+    if (beepStep >= beep_repeat * 2) {
+      if(DEBUG_LOG) Serial.printf("Stopping beep after %d duration and %d repeats\n", beep_duration, beep_repeat);
+    //  if(DEBUG_LOG) Serial.printf("Stopping beep \n");
+      stopBeep();
+    }
+  }
+}
+
+void processRelayState() {
+  if(!isRelayOpen) return;
+    
+  unsigned long currentMillis = millis();
+  if (currentMillis - lastRelayOpenTime >= relay_open_duration) {
+    if(DEBUG_LOG) Serial.println("Relay open duration elapsed");
+    setRelayState(LOW);
+    isRelayOpen = false;
+  }
+}
+
+void successRelay() {
+  isRelayOpen = true;
+  lastRelayOpenTime = millis();
+  setRelayState(HIGH);
+}
+
+void setRelayState(uint8_t state) {
+  digitalWrite(RELAY1_PIN, state);
+  if(DEBUG_LOG) Serial.printf("Setting Relay state to %d\n", state);
+  if (useBothRelays) {
+    digitalWrite(RELAY2_PIN, state);
+    if(DEBUG_LOG) Serial.printf("Setting Both Relay's state to %d\n", state);
+  }
+}
+
+void handleWiegand() {
+  if (entryReader.available() || leaveReader.available()) {
+    uint32_t cardId;
+    bool isEntry = entryReader.available();
+
+    if (isEntry) {
+      cardId = entryReader.getCode();
+    } else {
+      cardId = leaveReader.getCode();
+    }
+
+    if(DEBUG_LOG) Serial.printf("Card detected. Card ID: %d\n", cardId);
+
+    uint16_t userId = getUserIdFromCard(cardId);
+    
+    if(DEBUG_LOG) Serial.printf("User ID associated with card: %d\n", cardId);
+
+    if (userId == 0) {
+      #if HAS_BACKEND
+      enqueueLogEntry(cardId, 0, AUTH_ATTEMPT_NOT_REGISTERED);
+      #endif
+      if(DEBUG_LOG) Serial.printf("Card ID: %lu is not registered.\n", cardId);
+      errorBeep();
+      return;
+    }
+
+    uint32_t userMetadata = getUserMetadata(userId);
+
+    if(DEBUG_LOG) Serial.printf("User Metadata bitmask for Gate: %d\n", userMetadata);
+
+
+    if (userMetadata & DEACTIVATED_FLAG) {
+      #if HAS_BACKEND
+      enqueueLogEntry(cardId, userId, AUTH_ATTEMPT_DEACTIVATED_CARD);
+      #endif
+      if(DEBUG_LOG) Serial.printf("Card ID: %lu, User ID: %lu - Access denied (Deactivated).\n", cardId, userId);
+      errorBeep();
+      return;
+    }
+
+    if (userMetadata & INTERMEDIARY_GATE_FLAG) {
+      #if HAS_BACKEND
+      enqueueLogEntry(cardId, userId, AUTH_ATTEMPT_INTERMEDIARY_ACCESS);
+      #endif
+      if(DEBUG_LOG) Serial.printf("Card ID: %lu, User ID: %lu - Intermediary access allowed.\n", cardId, userId);
+      successBeep();
+      successRelay();
+      return;
+    }
+
+    if (!(userMetadata & ANTI_PASSBACK_FLAG)) {
+      #if HAS_BACKEND
+      enqueueLogEntry(cardId, userId, AUTH_ATTEMPT_ENTRY_ALLOWED);
+      #endif
+      if(DEBUG_LOG) Serial.printf("Card ID: %lu, User ID: %lu - Access allowed.\n", cardId, userId);
+      userMetadata |= ANTI_PASSBACK_FLAG;
+      setUserMetadata(userId, userMetadata);
+      successBeep();
+      successRelay();
+    } else {
+      #if HAS_BACKEND
+      enqueueLogEntry(cardId, userId, AUTH_ATTEMPT_ANTI_PASSBACK);
+      #endif
+      if(DEBUG_LOG) Serial.printf("Card ID: %lu, User ID: %lu - Access forbidden due to anti-passback.\n", cardId, userId);
+      errorBeep();
+    }
+  }
+}
+
+uint16_t getUserIdFromCard(uint32_t cardId) {
+  preferences.begin("card-mapping", true);
+  uint16_t userId = preferences.getUShort(String(cardId).c_str(), 0);
+  preferences.end();
+  return userId;
+}
+
+uint8_t getUserMetadata(uint16_t userId) {
+  preferences.begin("user-metadata", true);
+  uint8_t metadata = preferences.getUChar(String(userId).c_str(), 0);
+  preferences.end();
+  return metadata;
+}
+
+void setUserMetadata(uint16_t userId, uint32_t metadata, uint32_t cardId) {
+  if (cardId) {
+    preferences.begin("card-mapping", false);
+    preferences.putUShort(String(cardId).c_str(), userId);
+    preferences.end();
+  }
+
+  preferences.begin("user-metadata", false);
+  preferences.putUInt(String(userId).c_str(), metadata);
+  preferences.end();
+  Serial.printf("Set metadata for User ID %lu to %lu\n", userId, metadata);
+}
+
+#if HAS_BACKEND
 bool registerDevice() {
   String macAddress = WiFi.macAddress();
 
@@ -180,7 +596,7 @@ bool registerDevice() {
   String payload;
   serializeJson(jsonDoc, payload);
 
-  String response = postRequestWithPayload("/auth/register", payload);
+  String response = postRequestWithPayload("/device/register", payload);
 
   if (response.isEmpty()) {
     Serial.println("Failed to register device.");
@@ -196,24 +612,32 @@ bool registerDevice() {
     return false;
   }
 
-  // Parse and apply configurations
-  strlcpy(NTP_SERVER, responseDoc["ntpServer"].as<const char*>(), sizeof(NTP_SERVER));
-  POLLING_INTERVAL = responseDoc["pollingInterval"].as<long>();
-  QUEUE_SIZE = responseDoc["queueSize"].as<int>();
-  jwtToken = responseDoc["jwtToken"].as<String>();
+  // Store configurations in Preferences
+  preferences.begin("config", false); // Create or open a namespace
+
+  preferences.putBool("registered", true);
 
   if(responseDoc.containsKey("serverBaseUrl")) {
       strlcpy(SERVER_BASE_URL, responseDoc["serverBaseUrl"].as<const char*>(), sizeof(SERVER_BASE_URL));
+      preferences.putString("serverBaseUrl", SERVER_BASE_URL);
+  }
+  if(responseDoc.containsKey("ntpServer")) {
+    strlcpy(NTP_SERVER, responseDoc["ntpServer"].as<const char*>(), sizeof(NTP_SERVER));
+    preferences.putString("ntpServer", NTP_SERVER);
+  }
+  if(responseDoc.containsKey("pollingInterval")) {
+    POLLING_INTERVAL = responseDoc["pollingInterval"].as<long>();
+    preferences.putInt("pollingInterval", POLLING_INTERVAL);
+  }
+  if(responseDoc.containsKey("queueSize")) {
+    QUEUE_SIZE = responseDoc["queueSize"].as<int>();
+    preferences.putInt("queueSize", QUEUE_SIZE);
+  }
+  if(responseDoc.containsKey("jwtToken")) {
+    jwtToken = responseDoc["jwtToken"].as<String>();
+    preferences.putString("jwtToken", jwtToken);
   }
 
-  // Store configurations in Preferences
-  preferences.begin("config", false); // Create or open a namespace
-  preferences.putBool("registered", true);
-  preferences.putString("serverBaseUrl", SERVER_BASE_URL);
-  preferences.putString("ntpServer", NTP_SERVER);
-  preferences.putInt("pollingInterval", POLLING_INTERVAL);
-  preferences.putInt("queueSize", QUEUE_SIZE);
-  preferences.putString("jwtToken", jwtToken);
   preferences.end();
 
   // Handle initial commands from the server
@@ -234,42 +658,9 @@ bool registerDevice() {
   Serial.println("Device registered successfully and configuration updated.");
   return true;
 }
-
-void loop() {
-  unsigned long currentMillis = millis();
-
-  if(WiFi.status() != WL_CONNECTED) {
-    reconnectToWiFi();
-  }
-
-  if (currentMillis - previousMillis >= POLLING_INTERVAL) {
-    previousMillis = currentMillis;
-
-    // Attempt to register if not registered
-    if (!isRegistered) {
-      if(DEBUG_LOG) Serial.print("Not registered, registering to server ...");
-      isRegistered = registerDevice();
-    } else {
-      // Once registered, start polling for commands
-      pollServerForCommands();
-    }
-  }
-
-  // if(DEV_MODE && currentMillis - previousTimeUpdateMillis >= 5000) {
-  //   previousTimeUpdateMillis = currentMillis;
-  //   timeClient.update();
-  //   if(DEBUG_LOG) Serial.printf("Updated time. Current time: %s\n", timeClient.getFormattedTime().c_str());
-  // }
-  //update the time every 60 seconds
-  else if (currentMillis - previousTimeUpdateMillis >= 60000) {
-    previousTimeUpdateMillis = currentMillis;
-    timeClient.update();
-    if(DEBUG_LOG) Serial.printf("Updated time. Current time: %s\n", timeClient.getFormattedTime().c_str());
-  }
-
-  handleWiegand();
-  processBeep();
-  processRelayState();
+// Reconnect to WiFi using current global parameters
+void reconnectToWiFi() {
+  connectToWiFi(WIFI_SSID, WIFI_PASSWORD);
 }
 
 // Reusable WiFi Connection Function
@@ -286,16 +677,18 @@ void connectToWiFi(const char* ssid, const char* password) {
 
   WiFi.begin(ssid, password);
 
-  // int retries = 0;
-  // while (WiFi.status() != WL_CONNECTED) {
-  //   delay(1000);
-  //   Serial.print(".");
-  //   retries++;
-  //   if (retries > 10) {
-  //     Serial.println("Wi-Fi connection failed. Continuing without internet.");
-  //     return;
-  //   }
-  // }
+  int retries = 0;
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(1000);
+    Serial.print(".");
+    retries++;
+    if (retries > 10) {
+      Serial.println("Wi-Fi connection failed. Continuing without internet.");
+      return;
+    }
+  }
+
+  hasInitialWifiConnectionCompleted = true;
 
   if(INIT_LOG) {
     Serial.println();
@@ -306,11 +699,6 @@ void connectToWiFi(const char* ssid, const char* password) {
     Serial.printf("MAC Address: %s\n", WiFi.macAddress().c_str());
 
   }
-}
-
-// Reconnect to WiFi using current global parameters
-void reconnectToWiFi() {
-  connectToWiFi(WIFI_SSID, WIFI_PASSWORD);
 }
 
 void pollServerForCommands() {
@@ -459,199 +847,143 @@ IPAddress IPAddressFromString(const char* str) {
   return IPAddress(ip[0], ip[1], ip[2], ip[3]);
 }
 
-void sendLogQueue() {
-  if (logQueueIndex == 0) {
-    if(DEBUG_LOG) Serial.println("Log queue is empty. Nothing to send.");
-    return;
+bool sendLogQueue() {
+  LogEntry entry = dequeueLogEntry();
+
+  if (entry.cardId == 0 && entry.userId == 0 && entry.timestamp == 0) {
+    Serial.println("Queue is empty.");
+    return false;
+  } 
+
+  if(DEBUG_LOG) {
+    printQueue();
   }
 
-  StaticJsonDocument<1024> jsonDoc;
+  // StaticJsonDocument<1024> jsonDoc;
+  DynamicJsonDocument jsonDoc(QUEUE_SIZE);
   JsonArray logArray = jsonDoc.to<JsonArray>();
 
-  for (int i = 0; i < logQueueIndex; i++) {
+  for(int i = 0; i < QUEUE_SIZE; i++) {
     JsonObject logEntry = logArray.createNestedObject();
-    logEntry["cardId"] = logQueue[i].cardId;
-    logEntry["userId"] = logQueue[i].userId;
-    logEntry["attempt"] = logQueue[i].attempt;
-    logEntry["timestamp"] = logQueue[i].timestamp;
+    logEntry["cardId"] = entry.cardId;
+    logEntry["userId"] = entry.userId;
+    logEntry["attempt"] = entry.attempt;
+    logEntry["timestamp"] = entry.timestamp;
+
+    entry = dequeueLogEntry();
+    if (entry.cardId == 0 && entry.userId == 0 && entry.timestamp == 0) {
+      Serial.println("Queue is empty.");
+      break;
+    } 
+
   }
 
   String payload;
   serializeJson(jsonDoc, payload);
 
-  postRequestWithPayload("/logs", payload);
-  logQueueIndex = 0;
-}
+  String response = postRequestWithPayload("/logs", payload);
 
-void successBeep() {
-  startBeep(successBeepDuration, successBeepRepeat);
-}
-
-void errorBeep() {
-  startBeep(failBeepDuration, failBeepRepeat);
-}
-
-void startBeep(uint16_t duration, uint16_t repeat) {
-  isBeeping = true;
-  beep_duration = duration;
-  beep_repeat = repeat;
-  lastBeepTime = millis();
-  digitalWrite(PIN_BEEP, HIGH);
-  beepStep = 0;
-}
-
-void stopBeep() {
-  isBeeping = false;
-  digitalWrite(PIN_BEEP, LOW);
-}
-
-//TODO: fix
-void processBeep() {
-  if (!isBeeping) return;
-
-  // if(DEBUG_LOG) Serial.println("Processing beep");
-  unsigned long currentMillis = millis();
-  if (currentMillis - lastBeepTime >= beep_duration) {
-    if(DEBUG_LOG) Serial.println("Beep duration elapsed");
-    digitalWrite(PIN_BEEP, !digitalRead(PIN_BEEP));
-    // digitalWrite(PIN_BEEP, LOW);
-    lastBeepTime = currentMillis;
-    beepStep++;
-
-    if (beepStep >= beep_repeat * 2) {
-      if(DEBUG_LOG) Serial.printf("Stopping beep after %d duration and %d repeats\n", beep_duration, beep_repeat);
-    //  if(DEBUG_LOG) Serial.printf("Stopping beep \n");
-      stopBeep();
-    }
+  if (response.isEmpty()) {
+    Serial.println("Failed to send logs");
+    return false;
   }
+
+  return true;
 }
 
-void processRelayState() {
-  if(!isRelayOpen) return;
-    
-  unsigned long currentMillis = millis();
-  if (currentMillis - lastRelayOpenTime >= relay_open_duration) {
-    if(DEBUG_LOG) Serial.println("Relay open duration elapsed");
-    setRelayState(LOW);
-    isRelayOpen = false;
-  }
-}
+void enqueueLogEntry(uint32_t cardId, uint32_t userId, uint8_t attempt) {
+  preferences.begin("logs", false);
 
-void successRelay() {
-  isRelayOpen = true;
-  lastRelayOpenTime = millis();
-  setRelayState(HIGH);
-}
+  // Get the current write index
+  uint32_t writeIndex = preferences.getUInt("writeIndex", 0);
+  uint32_t readIndex = preferences.getUInt("readIndex", 0);
 
-void setRelayState(uint8_t state) {
-  digitalWrite(RELAY1_PIN, state);
-  if(DEBUG_LOG) Serial.printf("Setting Relay state to %d\n", state);
-  if (useBothRelays) {
-    digitalWrite(RELAY2_PIN, state);
-    if(DEBUG_LOG) Serial.printf("Setting Both Relay's state to %d\n", state);
-  }
-}
-
-void handleWiegand() {
-  if (entryReader.available() || leaveReader.available()) {
-    uint32_t cardId;
-    bool isEntry = entryReader.available();
-
-    if (isEntry) {
-      cardId = entryReader.getCode();
-    } else {
-      cardId = leaveReader.getCode();
-    }
-
-    if(DEBUG_LOG) Serial.printf("Card detected. Card ID: %d\n", cardId);
-
-    uint16_t userId = getUserIdFromCard(cardId);
-    
-    if(DEBUG_LOG) Serial.printf("User ID associated with card: %d\n", cardId);
-
-    if (userId == 0) {
-      enqueueLogEntry(cardId, 0, NOT_REGISTERED);
-      if(DEBUG_LOG) Serial.printf("Card ID: %lu is not registered.\n", cardId);
-      errorBeep();
-      return;
-    }
-
-    uint32_t userMetadata = getUserMetadata(userId);
-
-    if(DEBUG_LOG) Serial.printf("User Metadata bitmask for Gate: %d\n", userMetadata);
-
-
-    if (userMetadata & DEACTIVATED_FLAG) {
-      enqueueLogEntry(cardId, userId, DEACTIVATED_CARD);
-      if(DEBUG_LOG) Serial.printf("Card ID: %lu, User ID: %lu - Access denied (Deactivated).\n", cardId, userId);
-      errorBeep();
-      return;
-    }
-
-    if (userMetadata & INTERMEDIARY_GATE_FLAG) {
-      enqueueLogEntry(cardId, userId, INTERMEDIARY_ACCESS);
-      if(DEBUG_LOG) Serial.printf("Card ID: %lu, User ID: %lu - Intermediary access allowed.\n", cardId, userId);
-      successBeep();
-      successRelay();
-      return;
-    }
-
-    if (!(userMetadata & ANTI_PASSBACK_FLAG)) {
-      enqueueLogEntry(cardId, userId, ENTRY_ALLOWED);
-      if(DEBUG_LOG) Serial.printf("Card ID: %lu, User ID: %lu - Access allowed.\n", cardId, userId);
-      userMetadata |= ANTI_PASSBACK_FLAG;
-      setUserMetadata(userId, userMetadata);
-      successBeep();
-      successRelay();
-    } else {
-      enqueueLogEntry(cardId, userId, ANTI_PASSBACK);
-      if(DEBUG_LOG) Serial.printf("Card ID: %lu, User ID: %lu - Access forbidden due to anti-passback.\n", cardId, userId);
-      errorBeep();
-    }
-  }
-}
-
-void enqueueLogEntry(uint32_t cardId, uint32_t userId, AuthAttempt attempt) {
-  if (logQueueIndex >= QUEUE_SIZE) {
-    if(DEBUG_LOG) Serial.println("Log queue full. Dropping entry.");
+  // Check if the queue is full
+  if (((writeIndex + 1) % QUEUE_SIZE) == readIndex) {
+    if (DEBUG_LOG) Serial.println("Log queue full. Dropping entry.");
+    preferences.end();
     return;
   }
 
-  LogEntry entry;
-  entry.cardId = cardId;
-  entry.userId = userId;
-  entry.attempt = attempt;
-  entry.timestamp = timeClient.getEpochTime();
+  // Store the log entry in flash
+  String baseKey = String(writeIndex) + "_"; // Prefix for log keys
+  preferences.putUInt((baseKey + "logIndex").c_str(), logIndex);
+  preferences.putUInt((baseKey + "cardId").c_str(), cardId);
+  preferences.putUInt((baseKey + "userId").c_str(), userId);
+  preferences.putULong((baseKey + "timestamp").c_str(), timeClient.getEpochTime());
+  preferences.putChar((baseKey + "attempt").c_str(), attempt);
 
-  logQueue[logQueueIndex++] = entry;
+  // Update the write index
+  writeIndex = (writeIndex + 1) % QUEUE_SIZE;
+  preferences.putUInt("writeIndex", writeIndex);
+
+  preferences.end();
+
+  preferences.begin("config");
+  preferences.putUInt("logIndex", logIndex);
+  preferences.end();
+
+  logIndex += 1;
+  
   Serial.println("Log entry added to queue.");
 }
 
-uint16_t getUserIdFromCard(uint32_t cardId) {
-  preferences.begin("card-mapping", true);
-  uint16_t userId = preferences.getUShort(String(cardId).c_str(), 0);
-  preferences.end();
-  return userId;
-}
+LogEntry dequeueLogEntry() {
+  preferences.begin("logs", false);
 
-uint32_t getUserMetadata(uint16_t userId) {
-  preferences.begin("user-metadata", true);
-  uint32_t metadata = preferences.getUInt(String(userId).c_str(), 0);
-  preferences.end();
-  return metadata;
-}
+  // Get the current write and read indices
+  uint32_t writeIndex = preferences.getUInt("writeIndex", 0);
+  uint32_t readIndex = preferences.getUInt("readIndex", 0);
 
-void setUserMetadata(uint16_t userId, uint32_t metadata, uint32_t cardId) {
-  if (cardId) {
-    preferences.begin("card-mapping", false);
-    preferences.putUShort(String(cardId).c_str(), userId);
+  // Check if the queue is empty
+  if (readIndex == writeIndex) {
+    if (DEBUG_LOG) Serial.println("Log queue is empty. Nothing to dequeue.");
     preferences.end();
+    return {0, 0, 0, 'N'}; // Return a default entry to indicate an empty queue
   }
 
-  preferences.begin("user-metadata", false);
-  preferences.putUInt(String(userId).c_str(), metadata);
+  // Read the log entry from flash
+  String baseKey = String(readIndex) + "_";
+  uint32_t cardId = preferences.getUInt((baseKey + "cardId").c_str(), 0);
+  uint32_t userId = preferences.getUInt((baseKey + "userId").c_str(), 0);
+  uint32_t timestamp = preferences.getULong((baseKey + "timestamp").c_str(), 0);
+  uint8_t attempt = preferences.getChar((baseKey + "attempt").c_str(), 'N');
+
+  // Debug log the dequeued entry
+  if (DEBUG_LOG) {
+    Serial.printf("Dequeued Log - Card ID: %u, User ID: %u, Timestamp: %u, Attempt: %d\n",
+                  cardId, userId, timestamp, attempt);
+  }
+
+  // Update the read index
+  readIndex = (readIndex + 1) % QUEUE_SIZE;
+  preferences.putUInt("readIndex", readIndex);
+
   preferences.end();
-  Serial.printf("Set metadata for User ID %lu to %lu\n", userId, metadata);
+
+  // Construct and return the log entry
+  return {cardId, userId, timestamp, attempt};
+}
+
+void printQueue() {
+  preferences.begin("logs", true);
+
+  uint32_t writeIndex = preferences.getUInt("writeIndex", 0);
+  uint32_t readIndex = preferences.getUInt("readIndex", 0);
+
+  Serial.println("Current Queue:");
+  while (readIndex != writeIndex) {
+    String baseKey = String(readIndex) + "_";
+    uint32_t cardId = preferences.getUInt((baseKey + "cardId").c_str(), 0);
+    uint32_t userId = preferences.getUInt((baseKey + "userId").c_str(), 0);
+    uint8_t attempt = preferences.getChar((baseKey + "attempt").c_str(), 0);
+
+    Serial.printf("Card ID: %d, User ID: %d, , Attempt: %d\n", cardId, userId, attempt);
+
+    readIndex = (readIndex + 1) % QUEUE_SIZE;
+  }
+
+  preferences.end();
 }
 
 String getRequestWithAuth(const String& endpoint) {
@@ -698,3 +1030,4 @@ String postRequestWithPayload(const String& endpoint, const String& payload) {
   http.end();
   return response;
 }
+#endif

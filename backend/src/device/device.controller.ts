@@ -4,8 +4,8 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { JwtService } from '@nestjs/jwt';
 import { Device } from 'src/device/entities/device.entity';
-import { CommandService } from 'src/command/command.service';
 import { CommandDto } from 'src/command/dto/command.dto';
+import { CommandService } from 'src/command/command.service';
 // import * as os from 'os'; // Import the os module
 
 class RegisterDto {
@@ -14,39 +14,19 @@ class RegisterDto {
 
 class RegisterResponseDto {
   serverBaseUrl?: string;
-  ntpServer: string;
-  pollingInterval: number;
-  queueSize: number;
+  ntpServer?: string;
+  pollingInterval?: number;
+  queueSize?: number;
   jwtToken: string;
-  initialCommands: CommandDto[];
+  initialCommands?: CommandDto[];
 }
 
-@ApiTags('auth')
-@Controller('auth')
-export class AuthController {
-  // Method to get the local IP address
-  // private getLocalIPAddress(): string {
-  //   const networkInterfaces = os.networkInterfaces();
-  //   for (const interfaceName in networkInterfaces) {
-  //     const interfaces = networkInterfaces[interfaceName];
-  //     if (interfaces) {
-  //       for (const iface of interfaces) {
-  //         if (iface.family === 'IPv4' && !iface.internal) {
-  //           return iface.address;
-  //         }
-  //       }
-  //     }
-  //   }
-  //   return '127.0.0.1'; // Fallback to localhost if no private IP is found
-  // }
-
-  // Default values
-  // private readonly DEFAULT_SERVER_BASE_URL = `http://${this.getLocalIPAddress()}:${process.env.PORT || 3003}`;
-  private readonly DEFAULT_NTP_SERVER = 'pool.ntp.org';
-  private readonly DEFAULT_POLLING_INTERVAL =
-    process.env.NODE_ENV == 'development' ? 10000 : 3000;
-  private readonly DEFAULT_QUEUE_SIZE =
-    process.env.NODE_ENV == 'development' ? 50 : 10;
+@ApiTags('device')
+@Controller('device')
+export class DeviceController {
+  //   private readonly DEFAULT_NTP_SERVER = 'pool.ntp.org';
+  //   private readonly DEFAULT_POLLING_INTERVAL =
+  //     process.env.NODE_ENV == 'development' ? 10000 : 3000;
 
   constructor(
     @InjectRepository(Device)
@@ -76,13 +56,15 @@ export class AuthController {
     }
 
     // Retrieve queued commands for the device
+    // const initialCommands =
+    //   await this.commandService.getUnsentCommandsForDevice(macAddress);
     const initialCommands =
-      await this.commandService.getCommandsForDevice(macAddress);
+      await this.commandService.getUnsentCommandsForDevice(device.macAddress);
 
     // Generate a JWT token with the macAddress as the payload
     const jwtToken = this.jwtService.sign(
       { id: macAddress },
-      { secret: process.env.JWT_SECRET },
+      { secret: process.env.DEVICE_JWT_SECRET },
     );
 
     // Clear the commands after reading them (optional)
@@ -90,11 +72,8 @@ export class AuthController {
 
     // Create and return the response with the commands from DB or defaults
     return {
-      // serverBaseUrl: this.DEFAULT_SERVER_BASE_URL,
-      ntpServer: this.DEFAULT_NTP_SERVER,
-      pollingInterval: this.DEFAULT_POLLING_INTERVAL,
-      queueSize: this.DEFAULT_QUEUE_SIZE,
       jwtToken, // Include the JWT token in the response
+      //   ntpServer: this.DEFAULT_NTP_SERVER,
       initialCommands: initialCommands.map((command) => ({
         name: command.name,
         payload: command.payload,

@@ -6,6 +6,8 @@ import {
   Request,
   Body,
   Post,
+  Logger,
+  // BadRequestException,
 } from '@nestjs/common';
 import {
   ApiBearerAuth,
@@ -14,19 +16,20 @@ import {
   ApiResponse,
   ApiTags,
 } from '@nestjs/swagger';
-import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { CommandService } from './command.service';
 import { CommandDto } from './dto/command.dto';
 import { CommandType } from './command-types';
-import { AuthGuard } from '@nestjs/passport';
+import { TokenAuthGuard } from 'src/auth/guards/auth.guard';
+import { DeviceAuthGuard } from 'src/auth/guards/device.guard';
 
 @ApiTags('commands')
 @ApiBearerAuth()
 @Controller('commands')
 export class CommandController {
+  private readonly logger = new Logger(CommandController.name);
   constructor(private readonly commandService: CommandService) {}
 
-  @UseGuards(JwtAuthGuard)
+  @UseGuards(DeviceAuthGuard)
   @Get()
   @ApiOperation({
     summary: 'Get the list of commands for the device and clear them',
@@ -36,29 +39,52 @@ export class CommandController {
     description: 'List of commands',
     type: [CommandDto],
   })
-  async getAndClearCommands(@Request() req): Promise<CommandDto[]> {
-    const device = req.user; // The authenticated device
+  async getCommands(@Request() req): Promise<CommandDto[]> {
+    const device = req.device; // The authenticated device
     console.log('Device:', device);
 
-    // Fetch commands from the database
-    const commands: CommandDto[] =
-      await this.commandService.getCommandsForDevice(device.macAddress);
+    // Perform sanity check for the latest executed command
+    // const isSynced = await this.deviceService.checkCommandSyncStatus(
+    //   device.macAddress,
+    // );
+    // if (!isSynced) {
+    //   throw new BadRequestException(
+    //     'Device has not executed the latest command. Please ensure proper execution before fetching new commands.',
+    //   );
+    // }
 
-    // Add the FETCH_LOGS command to the list
+    // Fetch commands from the database
+    // const commands = await this.commandService.getUnsentCommandsForDevice(
+    //   device.macAddress,
+    // );
+
+    const commands = await this.commandService.getUnsentCommandsForDevice(
+      device.macAddress,
+    );
+
+    // Map Command entities to CommandDto objects
+    const commandDtos: CommandDto[] = commands.map((command) => ({
+      name: command.name,
+      payload: command.payload,
+    }));
+
+    const commandIds = commands.map((c) => c.id);
+    this.logger.log(`Marking commands as sent: ${commandIds}`);
+    const affected = await this.commandService.markCommandsAsSent(commandIds);
+    this.logger.log(`Marked ${affected} commands as sent`);
+
+    // Add the FETCH_LOGS command to the list in all cases
     const fetchLogsCommand: CommandDto = {
       name: CommandType.FETCH_LOGS,
       payload: {},
     };
-    commands.push(fetchLogsCommand);
+    commandDtos.push(fetchLogsCommand);
 
-    // Clear the commands from the database
-    await this.commandService.clearCommands(device.macAddress);
-
-    return commands;
+    return commandDtos;
   }
 
   @Post('queue')
-  @UseGuards(AuthGuard('basic'))
+  @UseGuards(TokenAuthGuard)
   @ApiBody({ description: 'Queue commands for a device' })
   @ApiResponse({ status: 201, description: 'Commands queued successfully' })
   async queueCommands(

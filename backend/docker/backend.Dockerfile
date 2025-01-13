@@ -9,17 +9,17 @@ RUN npm install -g @nestjs/cli
 
 # Copy package.json
 COPY package.json package-lock.json ./
-COPY .env ./
-COPY . .
+#COPY .env ./
+#COPY . .
 
 # Install dependencies, specifically re-building native modules inside Docker
-RUN npm ci
+RUN npm install
 
 # Copy the rest of the application files
 COPY . .
 
 # Build the application
-RUN npm run build
+#RUN npm run build
 
 # Expose the port the app runs on
 EXPOSE 3002

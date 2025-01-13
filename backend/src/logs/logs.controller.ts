@@ -8,9 +8,8 @@ import {
   Logger,
   Query,
 } from '@nestjs/common';
-import { JwtAuthGuard } from 'src/auth/jwt-auth.guard';
 import { LogsService } from './logs.service';
-import { CreateLogDto } from './dto/create-log.dto';
+import { AuthAttempt, CreateLogDto } from './dto/create-log.dto';
 import {
   ApiTags,
   ApiOperation,
@@ -19,21 +18,26 @@ import {
   ApiQuery,
 } from '@nestjs/swagger';
 import { PaginationDto } from './dto/get-logs.dto';
+import { TokenAuthGuard } from 'src/auth/guards/auth.guard';
+import { UserService } from 'src/auth/services/user.service';
 
 @ApiTags('logs')
 @Controller('logs')
 export class LogsController {
   private readonly logger = new Logger(LogsController.name);
 
-  constructor(private readonly logsService: LogsService) {}
+  constructor(
+    private readonly logsService: LogsService,
+    private readonly userService: UserService, // Inject UserService for user updates
+  ) {}
 
   @Post()
-  @UseGuards(JwtAuthGuard)
-  @ApiOperation({ summary: 'Create multiple logs' })
+  @UseGuards(TokenAuthGuard)
+  @ApiOperation({ summary: 'Create multiple logs and process them' })
   @ApiBody({ type: [CreateLogDto] })
   @ApiResponse({
     status: 201,
-    description: 'The logs have been successfully created.',
+    description: 'The logs have been successfully created and processed.',
   })
   @ApiResponse({ status: 403, description: 'Forbidden.' })
   async createLog(@Request() req, @Body() logs: CreateLogDto[]) {
@@ -43,24 +47,33 @@ export class LogsController {
 
     try {
       const createdLogs = await Promise.all(
-        logs.map((log) => {
+        logs.map(async (log) => {
           // Convert Unix timestamp to JavaScript Date object
           const timestampDate = new Date(log.timestamp * 1000);
           this.logger.debug(
             `Processing log: cardId=${log.cardId}, userId=${log.userId}, attempt=${log.attempt}, timestamp=${timestampDate}`,
           );
 
-          return this.logsService.createLog(
+          // Create the log entry in the database
+          const createdLog = await this.logsService.createLog(
             log.cardId,
             log.userId,
             log.attempt,
-            timestampDate, // Pass the Date object
+            timestampDate,
             deviceId,
           );
+
+          // Process the log based on the attempt type
+          if (log.attempt === AuthAttempt.ENTRY_ALLOWED) {
+            await this.userService.markUserInsideWorkplace(log.cardId);
+          }
+          return createdLog;
         }),
       );
 
-      this.logger.log(`Successfully created ${createdLogs.length} logs.`);
+      this.logger.log(
+        `Successfully created and processed ${createdLogs.length} logs.`,
+      );
       return createdLogs;
     } catch (error) {
       this.logger.error('Error creating logs', error.stack);
@@ -117,7 +130,7 @@ export class LogsController {
   })
   @ApiResponse({ status: 200, description: 'List of logs by userId.' })
   async findByUserId(
-    @Query('userId') userId: string,
+    @Query('userId') userId: number,
     @Query() pagination: PaginationDto,
   ) {
     const { limit = 10, page = 1 } = pagination;
@@ -155,7 +168,7 @@ export class LogsController {
   })
   @ApiResponse({ status: 200, description: 'List of logs by cardId.' })
   async findByCardId(
-    @Query('cardId') cardId: string,
+    @Query('cardId') cardId: number,
     @Query() pagination: PaginationDto,
   ) {
     const { limit = 10, page = 1 } = pagination;
